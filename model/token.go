@@ -30,6 +30,7 @@ type Token struct {
 	FixedContent   string  `json:"fixed_content" gorm:"type:varchar(1000);"`
 	Subnet         *string `json:"subnet" gorm:"default:''"` // allowed subnet
 	Version        int64   `json:"version" gorm:"default:0"`
+	LastEnabledAt  int64   `json:"last_enabled_at" gorm:"bigint;default:0"`
 }
 
 func GetAllUserTokens(userId int, startIdx int, num int) ([]*Token, error) {

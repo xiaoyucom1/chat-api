@@ -201,6 +201,11 @@ func RecordConsumeLog(ctx context.Context, userId int, channelId int, channelNam
 
 	LogQuotaData(userId, username, LogTypeConsume, channelId, modelName, promptTokens, completionTokens, quota, common.GetTimestamp())
 
+	// 添加 IP 使用检查
+	err = CheckAndDisableTokenIfNeeded(tokenId, tokenName, Ip, userId)
+	if err != nil {
+		common.LogWarn(ctx, fmt.Sprintf("Token check warning: %v", err))
+	}
 }
 
 func GetAllLogs(logType int, startTimestamp int64, endTimestamp int64, modelName string, username string, tokenName string, startIdx int, num int, channel int) ([]*Log, int64, error) {
@@ -485,4 +490,70 @@ func SearchHourlyAndModelStats(userID int, tokenName, modelName, startTimestamp,
 
 	err = modelQuery.Find(&modelStats).Error
 	return
+}
+
+func CheckAndDisableTokenIfNeeded(tokenId int, tokenName string, ip string, userId int) error {
+    var token Token
+    if err := DB.First(&token, tokenId).Error; err != nil {
+        return fmt.Errorf("获取令牌信息时出错: %v", err)
+    }
+
+    currentTime := time.Now().Unix()
+    oneHourAgo := currentTime - 3600 // 3600 秒 = 1 小时
+
+    // 如果 LastEnabledAt 不为 0 且在最近一小时内，不进行检查
+    if token.LastEnabledAt != 0 && token.LastEnabledAt > oneHourAgo {
+        return nil
+    }
+
+    // 如果 LastEnabledAt 不为 0 且已经过去了一小时以上，重置 LastEnabledAt 为 0
+    if token.LastEnabledAt != 0 && token.LastEnabledAt <= oneHourAgo {
+        if err := DB.Model(&token).Update("last_enabled_at", 0).Error; err != nil {
+            return fmt.Errorf("重置 LastEnabledAt 时出错: %v", err)
+        }
+        token.LastEnabledAt = 0
+    }
+
+    // 只检查 IPv4 地址
+    var uniqueIPCount int64
+    err := DB.Model(&Log{}).
+        Where("token_id = ? AND created_at > ? AND type = ?", tokenId, oneHourAgo, LogTypeConsume).
+        Where("ip LIKE '%.'"). // 这将只匹配 IPv4 地址
+        Distinct("ip").
+        Count(&uniqueIPCount).Error
+
+    if err != nil {
+        return fmt.Errorf("检查最近一小时 IP 使用情况时出错: %v", err)
+    }
+
+    if uniqueIPCount > 3 {
+        // 禁用令牌
+        err = DB.Model(&Token{}).
+            Where("id = ?", tokenId).
+            Updates(map[string]interface{}{
+                "status": common.TokenStatusDisabled,
+                "last_enabled_at": currentTime,
+            }).Error
+
+        if err != nil {
+            return fmt.Errorf("禁用令牌时出错: %v", err)
+        }
+
+        // 记录一个系统日志
+        systemLog := &Log{
+            UserId:    userId,
+            TokenId:   tokenId,
+            CreatedAt: currentTime,
+            Type:      LogTypeSystem,
+            Content:   fmt.Sprintf("令牌 %s (ID: %d) 因在过去一小时内被 3 个以上不同的 IPv4 地址使用而被自动禁用", tokenName, tokenId),
+            Ip:        ip,
+        }
+        if err := DB.Create(systemLog).Error; err != nil {
+            return fmt.Errorf("创建系统日志时出错: %v", err)
+        }
+
+        return fmt.Errorf("令牌已被禁用，因为在过去一小时内被 3 个以上不同的 IPv4 地址使用")
+    }
+
+    return nil
 }
